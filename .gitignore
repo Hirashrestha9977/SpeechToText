@@ -1,8 +1,37 @@
+# macOS
 .DS_Store
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+DerivedData/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+timeline.xctimeline
+playground.xcworkspace
+
+# Swift Package Manager
 .build/
 .swiftpm/
 /Packages
-xcuserdata/
-DerivedData/
-*.xcframework
+Package.resolved
+
+# Build output (scripts/build-xcframework.sh)
 build/
+*.xcframework
+*.xcarchive
+
+# CocoaPods / Carthage
+Pods/
+Carthage/Build/
+
+# fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
