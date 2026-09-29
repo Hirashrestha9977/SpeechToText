@@ -193,3 +193,7 @@ The package is iOS-only, so run the tests on a simulator:
 ```sh
 xcodebuild test -scheme VoiceToText -destination 'platform=iOS Simulator,name=iPhone 15'
 ```
+
+## License
+
+VoiceToText is available under the MIT License. See [LICENSE](LICENSE).
