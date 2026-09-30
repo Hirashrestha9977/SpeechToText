@@ -116,6 +116,10 @@ public enum VoiceToTextError: Error, LocalizedError {
     case audioEngineFailed(Error)
     case recognitionFailed(Error)
     case interrupted
+    /// The language needs a `SpeechTranscriptionService` but none was provided.
+    case transcriptionServiceRequired(VoiceToTextLanguage)
+    /// The `SpeechTranscriptionService` failed, for example because of a network error.
+    case transcriptionFailed(Error)
 
     public var errorDescription: String? {
         switch self {
@@ -145,6 +149,10 @@ public enum VoiceToTextError: Error, LocalizedError {
             return "Speech recognition failed: \(error.localizedDescription)"
         case .interrupted:
             return "Recording was interrupted."
+        case .transcriptionServiceRequired(let language):
+            return "\(language.displayName) needs a transcription service. Pass one when creating VoiceToText."
+        case .transcriptionFailed(let error):
+            return "Could not convert speech to text: \(error.localizedDescription)"
         }
     }
 }

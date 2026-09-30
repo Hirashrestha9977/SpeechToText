@@ -7,6 +7,7 @@ A small Swift package for iOS that listens to the microphone and turns speech in
 - Delegate, closure, `async`/`await` and SwiftUI (`ObservableObject`) APIs
 - Microphone level for animating a meter
 - Optional on-device recognition, automatic punctuation (iOS 16+) and custom vocabulary
+- English and Nepali (Nepali through a speech-to-text API)
 
 ## Requirements
 
@@ -138,6 +139,44 @@ extension ViewController: VoiceToTextDelegate {
 
 All callbacks are delivered on the main thread, and `VoiceToText` should be used from the main thread.
 
+## Languages
+
+Choose a language with `VoiceToTextLanguage`: `.english` or `.nepali`.
+
+- **English** uses Apple's Speech framework, with live results.
+- **Nepali** isn't supported by Apple, so the audio is recorded (16 kHz mono) and, when the user stops talking, sent to a `SpeechTranscriptionService`. The text arrives once, as a final result. Only microphone permission is needed.
+
+`GoogleSpeechService` uses [Google Cloud Speech-to-Text](https://cloud.google.com/speech-to-text), which supports Nepali (`ne-NP`):
+
+```swift
+let service = GoogleSpeechService(apiKey: "YOUR_GOOGLE_CLOUD_API_KEY")
+
+// SwiftUI
+@StateObject private var speech = VoiceToTextModel(language: .nepali, transcriptionService: service)
+speech.setLanguage(.english)   // switch at any time
+
+// Or directly
+let voiceToText = VoiceToText(language: .nepali, transcriptionService: service)
+guard await voiceToText.requestAuthorization() == .authorized else { return }
+let text = try await voiceToText.listenOnce()
+```
+
+An API key inside an app can be extracted. Restrict it to your bundle ID in the Google Cloud console, or call your own backend by implementing `SpeechTranscriptionService`:
+
+```swift
+struct MyBackendService: SpeechTranscriptionService {
+    func transcribe(_ audio: VoiceToTextAudio, language: VoiceToTextLanguage) async throws -> String {
+        var request = URLRequest(url: URL(string: "https://example.com/transcribe?lang=\(language.languageCode)")!)
+        request.httpMethod = "POST"
+        request.httpBody = audio.wavData   // or audio.pcmData (raw LINEAR16)
+        let (data, _) = try await URLSession.shared.data(for: request)
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+```
+
+Without a service, starting in Nepali throws `.transcriptionServiceRequired(.nepali)`; a failed API call is reported as `.transcriptionFailed(error)`.
+
 ## Options
 
 Pass `VoiceToTextOptions` to `start(options:)`, `transcriptions(options:)`, `listenOnce(options:)` or `VoiceToTextModel(options:)`.
@@ -173,7 +212,7 @@ try voiceToText.start(options: options)
 
 `VoiceToTextState` is `.idle`, `.listening` or `.finishing` (recording stopped, waiting for the final result).
 
-`VoiceToTextError` conforms to `LocalizedError`, so `localizedDescription` gives a user-facing message. Cases include `.notAuthorized(status)`, `.unsupportedLocale`, `.recognizerUnavailable` (often no network), `.onDeviceRecognitionUnsupported`, `.alreadyListening`, `.noAudioInput`, `.audioSessionFailed`, `.audioEngineFailed`, `.recognitionFailed` and `.interrupted`.
+`VoiceToTextError` conforms to `LocalizedError`, so `localizedDescription` gives a user-facing message. Cases include `.notAuthorized(status)`, `.unsupportedLocale`, `.recognizerUnavailable` (often no network), `.onDeviceRecognitionUnsupported`, `.alreadyListening`, `.noAudioInput`, `.audioSessionFailed`, `.audioEngineFailed`, `.recognitionFailed`, `.interrupted`, `.transcriptionServiceRequired` and `.transcriptionFailed`.
 
 Useful helpers:
 

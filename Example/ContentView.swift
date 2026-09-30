@@ -1,14 +1,29 @@
 // Example SwiftUI screen. Copy into an iOS app that depends on the VoiceToText package,
 // and add NSMicrophoneUsageDescription and NSSpeechRecognitionUsageDescription to Info.plist.
+// Nepali is transcribed by Google Cloud Speech-to-Text; replace the API key below.
 
 import SwiftUI
 import VoiceToText
 
 struct ContentView: View {
-    @StateObject private var speech = VoiceToTextModel()
+    @StateObject private var speech = VoiceToTextModel(
+        language: .english,
+        transcriptionService: GoogleSpeechService(apiKey: "YOUR_GOOGLE_CLOUD_API_KEY")
+    )
 
     var body: some View {
         VStack(spacing: 24) {
+            Picker("Language", selection: Binding(
+                get: { speech.language ?? .english },
+                set: { speech.setLanguage($0) }
+            )) {
+                ForEach(VoiceToTextLanguage.allCases) { language in
+                    Text(language.displayName).tag(language)
+                }
+            }
+            .pickerStyle(SegmentedPickerStyle())
+            .disabled(speech.state != .idle)
+
             ScrollView {
                 Text(speech.transcript.isEmpty ? "Tap the microphone and start speaking…" : speech.transcript)
                     .font(.title3)
@@ -45,7 +60,7 @@ struct ContentView: View {
         switch speech.state {
         case .idle: return "Ready"
         case .listening: return "Listening…"
-        case .finishing: return "Finishing…"
+        case .finishing: return speech.language?.usesSpeechFramework == false ? "Converting…" : "Finishing…"
         }
     }
 }

@@ -43,6 +43,8 @@ public final class VoiceToText {
     public var onAudioLevel: ((Float) -> Void)?
 
     public let locale: Locale
+    /// The language chosen with `init(language:transcriptionService:)`, or `nil` for a custom locale.
+    public let language: VoiceToTextLanguage?
     public private(set) var state: VoiceToTextState = .idle
     /// The most recent result of the current or last session.
     public private(set) var latestResult: VoiceToTextResult?
@@ -50,19 +52,37 @@ public final class VoiceToText {
     public var isListening: Bool { state == .listening }
 
     /// Whether the recognizer can be used right now (it may need a network connection).
-    public var isAvailable: Bool { speechRecognizer?.isAvailable ?? false }
+    public var isAvailable: Bool {
+        switch engine {
+        case .speechFramework(let recognizer): return recognizer?.isAvailable ?? false
+        case .service(let service): return service != nil
+        }
+    }
 
-    /// Whether this locale can be transcribed without sending audio to Apple's servers.
+    /// Whether this locale can be transcribed without sending audio to Apple's servers
+    /// or a transcription service.
     public var supportsOnDeviceRecognition: Bool {
-        speechRecognizer?.supportsOnDeviceRecognition ?? false
+        guard case .speechFramework(let recognizer) = engine else { return false }
+        return recognizer?.supportsOnDeviceRecognition ?? false
     }
 
     // MARK: Private properties
 
-    private let speechRecognizer: SFSpeechRecognizer?
+    private enum Engine {
+        /// Apple's Speech framework; `nil` if it doesn't support the locale.
+        case speechFramework(SFSpeechRecognizer?)
+        /// Record the audio, then send it to a remote API; `nil` if none was provided.
+        case service(SpeechTranscriptionService?)
+    }
+
+    private let engine: Engine
     private let audioEngine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
+    private var recorder: AudioRecorder?
+    private var serviceTask: Task<Void, Never>?
+    /// Whether the microphone level has passed `speechLevelThreshold` this session.
+    private var heardSpeech = false
     private var options = VoiceToTextOptions()
     /// Incremented each session so late callbacks from an old task are ignored.
     private var sessionID = 0
@@ -77,14 +97,36 @@ public final class VoiceToText {
     /// - Parameter locale: The language to recognize. Defaults to the device's language.
     public init(locale: Locale = .current) {
         self.locale = locale
-        self.speechRecognizer = SFSpeechRecognizer(locale: locale)
-        self.speechRecognizer?.defaultTaskHint = .dictation
+        self.language = nil
+        self.engine = .speechFramework(Self.makeSpeechRecognizer(locale: locale))
         observeAudioSession()
+    }
+
+    /// - Parameters:
+    ///   - language: The language to recognize.
+    ///   - transcriptionService: Converts the recorded audio to text for languages Apple's
+    ///     Speech framework doesn't support (Nepali). Ignored for English.
+    public init(language: VoiceToTextLanguage, transcriptionService: SpeechTranscriptionService? = nil) {
+        self.locale = language.locale
+        self.language = language
+        if language.usesSpeechFramework {
+            self.engine = .speechFramework(Self.makeSpeechRecognizer(locale: language.locale))
+        } else {
+            self.engine = .service(transcriptionService)
+        }
+        observeAudioSession()
+    }
+
+    private static func makeSpeechRecognizer(locale: Locale) -> SFSpeechRecognizer? {
+        let recognizer = SFSpeechRecognizer(locale: locale)
+        recognizer?.defaultTaskHint = .dictation
+        return recognizer
     }
 
     deinit {
         observers.forEach(NotificationCenter.default.removeObserver)
         task?.cancel()
+        serviceTask?.cancel()
         if audioEngine.isRunning {
             audioEngine.stop()
             audioEngine.inputNode.removeTap(onBus: 0)
@@ -128,6 +170,33 @@ public final class VoiceToText {
         }
     }
 
+    /// The permissions this instance needs: only the microphone when a transcription
+    /// service is used, otherwise speech recognition as well.
+    public var authorizationStatus: VoiceToTextAuthorizationStatus {
+        guard case .service = engine else { return Self.authorizationStatus }
+        return Self.combine(speech: .authorized, microphone: Self.microphonePermission)
+    }
+
+    /// Asks for the permissions this instance needs. The completion handler is called on the main thread.
+    public func requestAuthorization(completion: @escaping (VoiceToTextAuthorizationStatus) -> Void) {
+        guard case .service = engine else {
+            Self.requestAuthorization(completion: completion)
+            return
+        }
+        Self.requestMicrophonePermission { _ in
+            DispatchQueue.main.async {
+                completion(Self.combine(speech: .authorized, microphone: Self.microphonePermission))
+            }
+        }
+    }
+
+    /// Asks for the permissions this instance needs.
+    public func requestAuthorization() async -> VoiceToTextAuthorizationStatus {
+        await withCheckedContinuation { continuation in
+            requestAuthorization { continuation.resume(returning: $0) }
+        }
+    }
+
     // MARK: Listening
 
     /// Starts recording and transcribing. Stops on its own after the silence timeout
@@ -136,17 +205,30 @@ public final class VoiceToText {
         dispatchPrecondition(condition: .onQueue(.main))
         guard state == .idle else { throw VoiceToTextError.alreadyListening }
 
-        let status = Self.authorizationStatus
+        let status = authorizationStatus
         guard status == .authorized else { throw VoiceToTextError.notAuthorized(status) }
-        guard let recognizer = speechRecognizer else { throw VoiceToTextError.unsupportedLocale(locale) }
-        guard recognizer.isAvailable else { throw VoiceToTextError.recognizerUnavailable }
-        if options.requiresOnDeviceRecognition && !recognizer.supportsOnDeviceRecognition {
-            throw VoiceToTextError.onDeviceRecognitionUnsupported
+
+        let recognizer: SFSpeechRecognizer?
+        switch engine {
+        case .speechFramework(let speechRecognizer):
+            guard let speechRecognizer = speechRecognizer else { throw VoiceToTextError.unsupportedLocale(locale) }
+            guard speechRecognizer.isAvailable else { throw VoiceToTextError.recognizerUnavailable }
+            if options.requiresOnDeviceRecognition && !speechRecognizer.supportsOnDeviceRecognition {
+                throw VoiceToTextError.onDeviceRecognitionUnsupported
+            }
+            recognizer = speechRecognizer
+        case .service(let service):
+            guard service != nil else {
+                throw VoiceToTextError.transcriptionServiceRequired(language ?? .nepali)
+            }
+            if options.requiresOnDeviceRecognition { throw VoiceToTextError.onDeviceRecognitionUnsupported }
+            recognizer = nil
         }
 
         self.options = options
         sessionID += 1
         latestResult = nil
+        heardSpeech = false
 
         if options.managesAudioSession {
             do {
@@ -158,15 +240,6 @@ public final class VoiceToText {
             }
         }
 
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = options.reportsPartialResults
-        request.requiresOnDeviceRecognition = options.requiresOnDeviceRecognition
-        request.contextualStrings = options.contextualStrings
-        request.taskHint = options.taskHint
-        if #available(iOS 16, *) {
-            request.addsPunctuation = options.addsPunctuation
-        }
-
         let inputNode = audioEngine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
@@ -174,9 +247,23 @@ public final class VoiceToText {
             throw VoiceToTextError.noAudioInput
         }
 
+        // Apple's recognizer transcribes live; a transcription service gets the recording at the end.
+        let request = recognizer.map { _ in Self.makeRequest(options: options) }
+        let recorder: AudioRecorder?
+        if recognizer == nil {
+            guard let audioRecorder = AudioRecorder(inputFormat: format) else {
+                deactivateAudioSession()
+                throw VoiceToTextError.noAudioInput
+            }
+            recorder = audioRecorder
+        } else {
+            recorder = nil
+        }
+
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self, weak request] buffer, _ in
             request?.append(buffer)
+            recorder?.append(buffer)
             let level = Self.normalizedLevel(of: buffer)
             DispatchQueue.main.async { self?.emitAudioLevel(level) }
         }
@@ -192,9 +279,12 @@ public final class VoiceToText {
 
         let session = sessionID
         self.request = request
-        task = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            DispatchQueue.main.async {
-                self?.handle(result: result, error: error, session: session)
+        self.recorder = recorder
+        if let recognizer = recognizer, let request = request {
+            task = recognizer.recognitionTask(with: request) { [weak self] result, error in
+                DispatchQueue.main.async {
+                    self?.handle(result: result, error: error, session: session)
+                }
             }
         }
 
@@ -216,6 +306,11 @@ public final class VoiceToText {
         stopAudio()
         request?.endAudio()
         setState(.finishing)
+
+        if case .service(let service?) = engine, let recorder = recorder {
+            transcribe(recorder.audio, with: service)
+            return
+        }
 
         // Don't wait forever if the recognizer never delivers a final result.
         finishingTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { [weak self] _ in
@@ -269,6 +364,55 @@ public final class VoiceToText {
     }
 
     // MARK: Recognition handling
+
+    private static func makeRequest(options: VoiceToTextOptions) -> SFSpeechAudioBufferRecognitionRequest {
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = options.reportsPartialResults
+        request.requiresOnDeviceRecognition = options.requiresOnDeviceRecognition
+        request.contextualStrings = options.contextualStrings
+        request.taskHint = options.taskHint
+        if #available(iOS 16, *) {
+            request.addsPunctuation = options.addsPunctuation
+        }
+        return request
+    }
+
+    private func transcribe(_ audio: VoiceToTextAudio, with service: SpeechTranscriptionService) {
+        guard heardSpeech, !audio.pcmData.isEmpty else {
+            finish(with: nil)
+            return
+        }
+        let session = sessionID
+        let language = self.language ?? .nepali
+        let deliver: (Result<String, Error>) -> Void = { [weak self] outcome in
+            DispatchQueue.main.async { self?.handle(transcription: outcome, session: session) }
+        }
+        serviceTask = Task {
+            do {
+                deliver(.success(try await service.transcribe(audio, language: language)))
+            } catch {
+                deliver(.failure(error))
+            }
+        }
+    }
+
+    private func handle(transcription: Result<String, Error>, session: Int) {
+        guard session == sessionID, state == .finishing else { return }
+        switch transcription {
+        case .success(let text):
+            let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else {
+                finish(with: nil)
+                return
+            }
+            let result = VoiceToTextResult(text: text, isFinal: true)
+            latestResult = result
+            emitResult(result)
+            finish(with: result)
+        case .failure(let error):
+            fail(.transcriptionFailed(error))
+        }
+    }
 
     private func handle(result: SFSpeechRecognitionResult?, error: Error?, session: Int) {
         guard session == sessionID, state != .idle else { return }
@@ -331,6 +475,11 @@ public final class VoiceToText {
 
     private func emitAudioLevel(_ level: Float) {
         guard state == .listening else { return }
+        if case .service = engine, level >= Self.speechLevelThreshold {
+            // No words arrive until the end, so treat loud input as speech for the silence timeout.
+            heardSpeech = true
+            resetSilenceTimer()
+        }
         delegate?.voiceToText(self, didUpdateAudioLevel: level)
         onAudioLevel?(level)
     }
@@ -351,6 +500,9 @@ public final class VoiceToText {
         request?.endAudio()
         request = nil
         task = nil
+        recorder = nil
+        serviceTask?.cancel()
+        serviceTask = nil
         sessionID += 1
         deactivateAudioSession()
     }
@@ -388,7 +540,7 @@ public final class VoiceToText {
                   let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                   AVAudioSession.InterruptionType(rawValue: rawType) == .began,
                   self.state == .listening else { return }
-            if self.latestResult == nil {
+            if self.latestResult == nil && !self.heardSpeech {
                 self.fail(.interrupted)
             } else {
                 self.stop()
@@ -405,6 +557,9 @@ public final class VoiceToText {
     }
 
     // MARK: Helpers
+
+    /// Microphone level (about -30 dB) above which input counts as speech when using a transcription service.
+    static let speechLevelThreshold: Float = 0.4
 
     static func normalizedLevel(of buffer: AVAudioPCMBuffer) -> Float {
         guard let samples = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return 0 }
